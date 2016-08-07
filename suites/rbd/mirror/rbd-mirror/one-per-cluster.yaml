@@ -7,6 +7,9 @@ overrides:
         # override to make these names predictable
         admin socket: /var/run/ceph/$cluster-$name.asok
         pid file: /var/run/ceph/$cluster-$name.pid
+        debug journaler: 30
+        debug rbd: 30
+        debug rbd_mirror: 30
 tasks:
 - rbd-mirror:
     client: cluster1.client.mirror
