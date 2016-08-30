@@ -64,9 +64,9 @@ class CephFSTestCase(unittest.TestCase):
     LOAD_SETTINGS = []
 
     def setUp(self):
-        if len(self.fs.mds_ids) < self.MDSS_REQUIRED:
+        if len(self.mds_cluster.mds_ids) < self.MDSS_REQUIRED:
             raise case.SkipTest("Only have {0} MDSs, require {1}".format(
-                len(self.fs.mds_ids), self.MDSS_REQUIRED
+                len(self.mds_cluster.mds_ids), self.MDSS_REQUIRED
             ))
 
         if len(self.mounts) < self.CLIENTS_REQUIRED:
@@ -82,11 +82,11 @@ class CephFSTestCase(unittest.TestCase):
                     raise case.SkipTest("kclient clients must be on separate nodes")
 
         if self.REQUIRE_ONE_CLIENT_REMOTE:
-            if self.mounts[0].client_remote.hostname in self.fs.get_mds_hostnames():
+            if self.mounts[0].client_remote.hostname in self.mds_cluster.get_mds_hostnames():
                 raise case.SkipTest("Require first client to be on separate server from MDSs")
 
         if self.REQUIRE_MEMSTORE:
-            objectstore = self.fs.get_config("osd_objectstore", "osd")
+            objectstore = self.mds_cluster.get_config("osd_objectstore", "osd")
             if objectstore != "memstore":
                 # You certainly *could* run this on a real OSD, but you don't want to sit
                 # here for hours waiting for the test to fill up a 1TB drive!
@@ -102,7 +102,7 @@ class CephFSTestCase(unittest.TestCase):
         for i in range(0, self.CLIENTS_REQUIRED):
             setattr(self, "mount_{0}".format(chr(ord('a') + i)), self.mounts[i])
 
-        self.fs.clear_firewall()
+        self.mds_cluster.clear_firewall()
 
         # Unmount in order to start each test on a fresh mount, such
         # that test_barrier can have a firm expectation of what OSD
@@ -118,29 +118,34 @@ class CephFSTestCase(unittest.TestCase):
         # the filesystem rather than just doing a rm -rf of files
         self.mds_cluster.mds_stop()
         self.mds_cluster.delete_all_filesystems()
+        self.fs = None # is now invalid!
 
         # In case the previous filesystem had filled up the RADOS cluster, wait for that
         # flag to pass.
-        osd_mon_report_interval_max = int(self.fs.get_config("osd_mon_report_interval_max", service_type='osd'))
-        self.wait_until_true(lambda: not self.fs.is_full(),
+        osd_mon_report_interval_max = int(self.mds_cluster.get_config("osd_mon_report_interval_max", service_type='osd'))
+        self.wait_until_true(lambda: not self.mds_cluster.is_full(),
                              timeout=osd_mon_report_interval_max * 5)
 
         # In case anything is in the OSD blacklist list, clear it out.  This is to avoid
         # the OSD map changing in the background (due to blacklist expiry) while tests run.
         try:
-            self.fs.mon_manager.raw_cluster_cmd("osd", "blacklist", "clear")
+            self.mds_cluster.mon_manager.raw_cluster_cmd("osd", "blacklist", "clear")
         except CommandFailedError:
             # Fallback for older Ceph cluster
-            blacklist = json.loads(self.fs.mon_manager.raw_cluster_cmd("osd",
+            blacklist = json.loads(self.mds_cluster.mon_manager.raw_cluster_cmd("osd",
                                   "dump", "--format=json-pretty"))['blacklist']
             log.info("Removing {0} blacklist entries".format(len(blacklist)))
             for addr, blacklisted_at in blacklist.items():
-                self.fs.mon_manager.raw_cluster_cmd("osd", "blacklist", "rm", addr)
+                self.mds_cluster.mon_manager.raw_cluster_cmd("osd", "blacklist", "rm", addr)
+
+        if self.REQUIRE_FILESYSTEM:
+            self.fs = self.mds_cluster.newfs(True)
+            self.fs.mds_restart()
 
         # In case some test messed with auth caps, reset them
         client_mount_ids = [m.client_id for m in self.mounts]
         for client_id in client_mount_ids:
-            self.fs.mon_manager.raw_cluster_cmd_result(
+            self.mds_cluster.mon_manager.raw_cluster_cmd_result(
                 'auth', 'caps', "client.{0}".format(client_id),
                 'mds', 'allow',
                 'mon', 'allow r',
@@ -157,11 +162,10 @@ class CephFSTestCase(unittest.TestCase):
         for entry in self.auth_list():
             ent_type, ent_id = entry['entity'].split(".")
             if ent_type == "client" and ent_id not in client_mount_ids and ent_id != "admin":
-                self.fs.mon_manager.raw_cluster_cmd("auth", "del", entry['entity'])
+                self.mds_cluster.mon_manager.raw_cluster_cmd("auth", "del", entry['entity'])
 
         if self.REQUIRE_FILESYSTEM:
-            self.fs.create()
-            self.fs.mds_restart()
+            # wait for mds restart to complete...
             self.fs.wait_for_daemons()
             if not self.mount_a.is_mounted():
                 self.mount_a.mount()
@@ -175,13 +179,13 @@ class CephFSTestCase(unittest.TestCase):
         # Load an config settings of interest
         for setting in self.LOAD_SETTINGS:
             setattr(self, setting, int(self.fs.mds_asok(
-                ['config', 'get', setting], self.fs.mds_ids[0]
+                ['config', 'get', setting], self.mds_cluster.mds_ids[0]
             )[setting]))
 
         self.configs_set = set()
 
     def tearDown(self):
-        self.fs.clear_firewall()
+        self.mds_cluster.clear_firewall()
         for m in self.mounts:
             m.teardown()
 
@@ -199,7 +203,7 @@ class CephFSTestCase(unittest.TestCase):
         """
         Convenience wrapper on "ceph auth list"
         """
-        return json.loads(self.fs.mon_manager.raw_cluster_cmd(
+        return json.loads(self.mds_cluster.mon_manager.raw_cluster_cmd(
             "auth", "list", "--format=json-pretty"
         ))['auth_dump']
 
@@ -277,12 +281,7 @@ class CephFSTestCase(unittest.TestCase):
         MDS ranks or in the list of standbys
         """
         def get_daemon_names():
-            fs_map = self.mds_cluster.get_fs_map()
-            names = [m['name'] for m in fs_map['standbys']]
-            for fs in fs_map['filesystems']:
-                names.extend([info['name'] for info in fs['mdsmap']['info'].values()])
-
-            return names
+            return [info['name'] for info in self.mds_cluster.status().get_all()]
 
         if daemon_ids is None:
             daemon_ids = self.mds_cluster.mds_ids
@@ -304,14 +303,14 @@ class CephFSTestCase(unittest.TestCase):
         it does)
         """
         try:
-            self.fs.mds_daemons[daemon_id].proc.wait()
+            self.mds_cluster.mds_daemons[daemon_id].proc.wait()
         except CommandFailedError as e:
             log.info("MDS '{0}' crashed with status {1} as expected".format(daemon_id, e.exitstatus))
-            self.fs.mds_daemons[daemon_id].proc = None
+            self.mds_cluster.mds_daemons[daemon_id].proc = None
 
             # Go remove the coredump from the crash, otherwise teuthology.internal.coredump will
             # catch it later and treat it as a failure.
-            p = self.fs.mds_daemons[daemon_id].remote.run(args=[
+            p = self.mds_cluster.mds_daemons[daemon_id].remote.run(args=[
                 "sudo", "sysctl", "-n", "kernel.core_pattern"], stdout=StringIO())
             core_pattern = p.stdout.getvalue().strip()
             if os.path.dirname(core_pattern):  # Non-default core_pattern with a directory in it
@@ -321,7 +320,7 @@ class CephFSTestCase(unittest.TestCase):
 
                 # Determine the PID of the crashed MDS by inspecting the MDSMap, it had
                 # to talk to the mons to get assigned a rank to reach the point of crashing
-                addr = self.fs.mon_manager.get_mds_status(daemon_id)['addr']
+                addr = self.mds_cluster.mon_manager.get_mds_status(daemon_id)['addr']
                 pid_str = addr.split("/")[1]
                 log.info("Determined crasher PID was {0}".format(pid_str))
 
@@ -330,7 +329,7 @@ class CephFSTestCase(unittest.TestCase):
                 core_glob = re.sub("%[a-z]", "*", core_glob)  # Match all for all other % tokens
 
                 # Verify that we see the expected single coredump matching the expected pattern
-                ls_proc = self.fs.mds_daemons[daemon_id].remote.run(args=[
+                ls_proc = self.mds_cluster.mds_daemons[daemon_id].remote.run(args=[
                     "sudo", "ls", run.Raw(core_glob)
                 ], stdout=StringIO())
                 cores = [f for f in ls_proc.stdout.getvalue().strip().split("\n") if f]
@@ -339,7 +338,7 @@ class CephFSTestCase(unittest.TestCase):
 
                 log.info("Found core file {0}, deleting it".format(cores[0]))
 
-                self.fs.mds_daemons[daemon_id].remote.run(args=[
+                self.mds_cluster.mds_daemons[daemon_id].remote.run(args=[
                     "sudo", "rm", "-f", cores[0]
                 ])
             else:
@@ -356,7 +355,7 @@ class CephFSTestCase(unittest.TestCase):
         :param expected_pattern: a string that you expect to see in the log output
         """
 
-        ceph_manager = self.fs.mon_manager
+        ceph_manager = self.mds_cluster.mon_manager
 
         class ContextManager(object):
             def match(self):
@@ -397,7 +396,7 @@ class CephFSTestCase(unittest.TestCase):
         Wait until 'ceph health' contains messages matching the pattern
         """
         def seen_health_warning():
-            health = self.fs.mon_manager.get_mon_health()
+            health = self.mds_cluster.mon_manager.get_mon_health()
             summary_strings = [s['summary'] for s in health['summary']]
             if len(summary_strings) == 0:
                 log.debug("Not expected number of summary strings ({0})".format(summary_strings))
@@ -417,7 +416,7 @@ class CephFSTestCase(unittest.TestCase):
         Wait until `ceph health` returns no messages
         """
         def is_clear():
-            health = self.fs.mon_manager.get_mon_health()
+            health = self.mds_cluster.mon_manager.get_mon_health()
             return len(health['summary']) == 0
 
         self.wait_until_true(is_clear, timeout)
